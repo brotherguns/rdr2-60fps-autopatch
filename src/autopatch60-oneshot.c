@@ -1,8 +1,12 @@
-﻿/* autopatch60-oneshot.c -- one-shot variant of the resident daemon.
+/* autopatch60-oneshot.c -- one-shot variant of the resident daemon.
  * Waits for the RDR2 eboot (max. 10 min), verifies, writes, re-verifies,
  * notifies and EXITS. No residency: after notifying, neither process
  * nor traffic remains. Same safety: it never writes without verifying
- * (64-byte context + original bytes). */
+ * (64-byte context + original bytes).
+ *
+ * PORT NOTE: the patch site (RVA 0x5453029 + 64-byte context) is byte-identical
+ * in the supplied eboot, which carries a region table with 4 RDR2 title IDs.
+ * Only the title-ID gate needed changing: it now accepts all four. */
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <stdint.h>
@@ -25,8 +29,8 @@
 #define PROT_EXEC 0x4u
 #define IMG_BASE_DEFAULT 0x400000u     /* base seen 100% of the time; fast-path only */
 
-/* 64-byte context of the clean 1.32 eboot around the target (target at +32).
- * Verified against the mounted patch0 copy and against live disassembly. */
+/* 64-byte context of the eboot around the target (target at +32).
+ * Verified against the supplied eboot (file-offset 0x5457029 in the ELF). */
 static const uint8_t JAO_CTX[64] = {
     0x89,0x04,0xe9,0x49,0xff,0xc5,0x4d,0x39,0xf5,0x0f,0x82,0xe8,0xfd,0xff,0xff,0x8b,
     0x05,0xb2,0xcf,0xd5,0x03,0x8b,0x3d,0xcc,0xd9,0xd6,0x03,0x8d,0x70,0xff,0x85,0xc0,
@@ -50,7 +54,22 @@ static void tlog(const char *msg) {
 static const uint8_t JAO_ORIG[3] = {0x0f, 0x44, 0xf0}; /* cmove esi,eax */
 static const uint8_t JAO_NEW[3]  = {0x31, 0xf6, 0x90}; /* xor esi,esi;nop */
 
-static const char WANT_TITLEID[] = "CUSA03041";
+/* All RDR2 PS4 title IDs listed in the eboot's region table. */
+static const char *const WANT_TITLEIDS[] = {
+    "CUSA03041",
+    "CUSA08519",
+    "CUSA08568",
+    "CUSA15698",
+};
+#define N_WANT (sizeof(WANT_TITLEIDS) / sizeof(WANT_TITLEIDS[0]))
+
+static int is_want(const char *tid) {
+    unsigned i;
+    for (i = 0; i < N_WANT; i++)
+        if (!strcmp(tid, WANT_TITLEIDS[i]))
+            return 1;
+    return 0;
+}
 
 static int g_sock = -1;
 
@@ -250,12 +269,9 @@ static int eboot_base(uint32_t pid, uint64_t *base) {
 #define POLL_FAST_USEC 500000u
 #define POLL_SPARSE_SEC 15u
 #define MAX_NOTIFIES_PER_PID 3u
-#define AUTOPATCH_VERSION "oneshot-1.1"
+#define AUTOPATCH_VERSION "oneshot-1.2"
 
 int main(void) {
-    /* Wait (max. 10 min) for RDR2 to boot, patch once verified and EXIT.
-     * No residency: after notifying, no process or traffic remains.
-     * If the game never shows up, exit quietly. */
     uint32_t pid = 0;
     char titleid[16] = {0};
     uint64_t base = 0, target = 0;
@@ -276,15 +292,15 @@ int main(void) {
     for (waited = 0; waited < LIMIT; waited++) {
         if (fg_app(&pid, titleid))
             break; /* dead connection: exit, nothing to patch */
-        if (pid && !strcmp(titleid, WANT_TITLEID))
+        if (pid && is_want(titleid))
             break;
         usleep(POLL_FAST_USEC);
     }
-    if (waited >= LIMIT || !pid || strcmp(titleid, WANT_TITLEID) != 0) {
+    if (waited >= LIMIT || !pid || !is_want(titleid)) {
         tlog("TIMEOUT_NO_GAME");
         return 0; /* quiet exit: nothing was ever launched */
     }
-    snprintf(lb, sizeof(lb), "SPAWN pid=%u", pid);
+    snprintf(lb, sizeof(lb), "SPAWN pid=%u tid=%.9s", pid, titleid);
     tlog(lb);
     /* 2) resolve target: CTX fast-path, MAPS fallback */
     target = IMG_BASE_DEFAULT + JAO_RVA;
